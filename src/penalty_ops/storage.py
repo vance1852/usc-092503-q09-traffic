@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterator
 
+from .models import allocation_fingerprint
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(user_id TEXT PRIMARY KEY,role TEXT NOT NULL,salt TEXT NOT NULL,password_hash TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id TEXT NOT NULL,expires_at TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1);
@@ -13,12 +15,20 @@ CREATE TABLE IF NOT EXISTS violation_records(violation_record_id TEXT PRIMARY KE
 CREATE TABLE IF NOT EXISTS alerts(alert_id TEXT PRIMARY KEY,case_record_id TEXT NOT NULL REFERENCES case_records(case_record_id),fingerprint TEXT NOT NULL UNIQUE,severity TEXT NOT NULL,score REAL NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,resolved_at TEXT);
 CREATE TABLE IF NOT EXISTS case_tickets(case_ticket_id TEXT PRIMARY KEY,case_record_id TEXT NOT NULL,alert_id TEXT NOT NULL,assignee TEXT NOT NULL,status TEXT NOT NULL,priority INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS response_resources(response_resource_id TEXT PRIMARY KEY,kind TEXT NOT NULL,district TEXT NOT NULL,capacity INTEGER NOT NULL,available INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS allocations(plan_id TEXT PRIMARY KEY,response_resource_id TEXT NOT NULL,case_ticket_id TEXT NOT NULL,quantity INTEGER NOT NULL,created_at TEXT NOT NULL,UNIQUE(response_resource_id,case_ticket_id));
+CREATE TABLE IF NOT EXISTS allocations(plan_id TEXT PRIMARY KEY,response_resource_id TEXT NOT NULL,case_ticket_id TEXT NOT NULL,quantity INTEGER NOT NULL,created_at TEXT NOT NULL,request_fingerprint TEXT,UNIQUE(response_resource_id,case_ticket_id));
 CREATE TABLE IF NOT EXISTS audit_events(event_id INTEGER PRIMARY KEY AUTOINCREMENT,entity_type TEXT NOT NULL,entity_id TEXT NOT NULL,action TEXT NOT NULL,actor TEXT NOT NULL,payload TEXT NOT NULL,created_at TEXT NOT NULL);
 """
 def utcnow() -> str: return datetime.now(timezone.utc).isoformat()
+def _migrate(db: sqlite3.Connection) -> None:
+    """为旧版本数据库补齐 allocations.request_fingerprint 并回填历史行，可重复执行。"""
+    columns={row[1] for row in db.execute("PRAGMA table_info(allocations)")}
+    if "request_fingerprint" not in columns:
+        try: db.execute("ALTER TABLE allocations ADD COLUMN request_fingerprint TEXT")
+        except sqlite3.OperationalError: pass
+    for row in db.execute("SELECT plan_id,response_resource_id,case_ticket_id,quantity FROM allocations WHERE request_fingerprint IS NULL"):
+        db.execute("UPDATE allocations SET request_fingerprint=? WHERE plan_id=?",(allocation_fingerprint(row[1],row[2],row[3]),row[0]))
 def connect(path: str = ":memory:") -> sqlite3.Connection:
-    db=sqlite3.connect(path,timeout=10); db.row_factory=sqlite3.Row; db.execute("PRAGMA foreign_keys=ON"); db.execute("PRAGMA journal_mode=WAL"); db.executescript(SCHEMA); db.commit(); return db
+    db=sqlite3.connect(path,timeout=10,check_same_thread=False); db.row_factory=sqlite3.Row; db.execute("PRAGMA foreign_keys=ON"); db.execute("PRAGMA journal_mode=WAL"); db.executescript(SCHEMA); _migrate(db); db.commit(); return db
 @contextmanager
 def transaction(db: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     try: db.execute("BEGIN IMMEDIATE"); yield db; db.commit()

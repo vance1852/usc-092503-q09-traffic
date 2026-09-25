@@ -2,7 +2,8 @@
 from __future__ import annotations
 import hashlib,uuid
 from .auth import Auth
-from .models import ViolationRecord,CaseRecord,as_dict,utcnow
+from .errors import Conflict
+from .models import ViolationRecord,CaseRecord,allocation_fingerprint,as_dict,normalize_quantity,utcnow
 from .risk import violation_probability,score_violation_record
 from .storage import audit,connect,rows,transaction
 class PenaltyService:
@@ -10,7 +11,7 @@ class PenaltyService:
     def bootstrap(self):
         for uid,pwd,role in (("admin","enforcement-admin","admin"),("operator","enforcement-operator","operator")):
             try:self.auth.create_user(uid,pwd,role)
-            except Exception:pass
+            except Exception:self.db.rollback()
     def register_case_record(self,token,case_record):
         actor=self.auth.require(token,"admin"); case_record.validate(); now=utcnow()
         with transaction(self.db):
@@ -64,15 +65,42 @@ class PenaltyService:
         return dict(row)
     def allocate(self,token,response_resource_id,case_ticket_id,quantity):
         actor=self.auth.require(token,"allocate")
-        if quantity<=0:raise ValueError("quantity must be positive")
-        aid="alloc-"+uuid.uuid4().hex[:16]
+        quantity=normalize_quantity(quantity); fingerprint=allocation_fingerprint(response_resource_id,case_ticket_id,quantity)
         with transaction(self.db):
             response_resource=self.db.execute("SELECT available FROM response_resources WHERE response_resource_id=?",(response_resource_id,)).fetchone()
             if not response_resource:raise KeyError(response_resource_id)
             if not self.db.execute("SELECT 1 FROM case_tickets WHERE case_ticket_id=?",(case_ticket_id,)).fetchone():raise KeyError(case_ticket_id)
-            if response_resource[0]<quantity:raise ValueError("response_resource capacity exceeded")
-            old=self.db.execute("SELECT plan_id FROM allocations WHERE response_resource_id=? AND case_ticket_id=?",(response_resource_id,case_ticket_id)).fetchone()
-            if old:return {"plan_id":old[0],"duplicate":True}
-            self.db.execute("INSERT INTO allocations VALUES(?,?,?,?,?)",(aid,response_resource_id,case_ticket_id,quantity,utcnow())); self.db.execute("UPDATE response_resources SET available=available-? WHERE response_resource_id=?",(quantity,response_resource_id)); audit(self.db,"response_resource",response_resource_id,"allocated",actor.user_id,{"case_ticket_id":case_ticket_id,"quantity":quantity})
-        return {"plan_id":aid,"duplicate":False,"response_resource_id":response_resource_id,"quantity":quantity}
+            old=self.db.execute("SELECT * FROM allocations WHERE response_resource_id=? AND case_ticket_id=?",(response_resource_id,case_ticket_id)).fetchone()
+            if old:
+                if old["request_fingerprint"]==fingerprint:return {"plan_id":old["plan_id"],"duplicate":True,"response_resource_id":response_resource_id,"case_ticket_id":case_ticket_id,"quantity":old["quantity"],"request_fingerprint":fingerprint}
+                raise Conflict(f"工单 {case_ticket_id} 已按数量 {old['quantity']} 分配资源 {response_resource_id}，与本次请求数量 {quantity} 冲突；库存未变更，如需调整请调用 adjust_allocation")
+            cursor=self.db.execute("UPDATE response_resources SET available=available-? WHERE response_resource_id=? AND available>=?",(quantity,response_resource_id,quantity))
+            if cursor.rowcount!=1:raise ValueError(f"资源 {response_resource_id} 可用余额 {response_resource[0]} 不足以分配 {quantity}")
+            aid="alloc-"+uuid.uuid4().hex[:16]
+            self.db.execute("INSERT INTO allocations(plan_id,response_resource_id,case_ticket_id,quantity,created_at,request_fingerprint) VALUES(?,?,?,?,?,?)",(aid,response_resource_id,case_ticket_id,quantity,utcnow(),fingerprint))
+            audit(self.db,"response_resource",response_resource_id,"allocated",actor.user_id,{"case_ticket_id":case_ticket_id,"quantity":quantity,"plan_id":aid,"request_fingerprint":fingerprint})
+        return {"plan_id":aid,"duplicate":False,"response_resource_id":response_resource_id,"case_ticket_id":case_ticket_id,"quantity":quantity,"request_fingerprint":fingerprint}
+    def adjust_allocation(self,token,plan_id,quantity,reason):
+        actor=self.auth.require(token,"allocate")
+        quantity=normalize_quantity(quantity)
+        if not str(reason).strip():raise ValueError("adjustment reason is required")
+        with transaction(self.db):
+            allocation=self.db.execute("SELECT * FROM allocations WHERE plan_id=?",(plan_id,)).fetchone()
+            if not allocation:raise KeyError(plan_id)
+            previous=allocation["quantity"]; delta=quantity-previous
+            if delta==0:return {"plan_id":plan_id,"adjusted":False,"response_resource_id":allocation["response_resource_id"],"case_ticket_id":allocation["case_ticket_id"],"quantity":quantity,"request_fingerprint":allocation["request_fingerprint"]}
+            if delta>0:
+                cursor=self.db.execute("UPDATE response_resources SET available=available-? WHERE response_resource_id=? AND available>=?",(delta,allocation["response_resource_id"],delta))
+                if cursor.rowcount!=1:
+                    available=self.db.execute("SELECT available FROM response_resources WHERE response_resource_id=?",(allocation["response_resource_id"],)).fetchone()[0]
+                    raise ValueError(f"资源 {allocation['response_resource_id']} 可用余额 {available} 不足以追加 {delta}")
+            else:self.db.execute("UPDATE response_resources SET available=available+? WHERE response_resource_id=?",(-delta,allocation["response_resource_id"]))
+            fingerprint=allocation_fingerprint(allocation["response_resource_id"],allocation["case_ticket_id"],quantity)
+            self.db.execute("UPDATE allocations SET quantity=?,request_fingerprint=? WHERE plan_id=?",(quantity,fingerprint,plan_id))
+            audit(self.db,"allocation",plan_id,"adjusted",actor.user_id,{"response_resource_id":allocation["response_resource_id"],"case_ticket_id":allocation["case_ticket_id"],"previous_quantity":previous,"quantity":quantity,"reason":reason})
+        return {"plan_id":plan_id,"adjusted":True,"response_resource_id":allocation["response_resource_id"],"case_ticket_id":allocation["case_ticket_id"],"quantity":quantity,"previous_quantity":previous,"request_fingerprint":fingerprint}
+    def allocation(self,token,plan_id):
+        self.auth.require(token,"read"); row=self.db.execute("SELECT * FROM allocations WHERE plan_id=?",(plan_id,)).fetchone()
+        if not row:raise KeyError(plan_id)
+        return dict(row)
     def audit_events(self,token,entity_type,entity_id): self.auth.require(token,"read"); return rows(self.db,"SELECT * FROM audit_events WHERE entity_type=? AND entity_id=? ORDER BY event_id",(entity_type,entity_id))

@@ -1,5 +1,6 @@
 """案件、读数、告警、工单和资源的领域模型。"""
 from __future__ import annotations
+import hashlib,json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -29,3 +30,17 @@ class ViolationRecord:
 
 def as_dict(value: Any) -> dict[str, Any]:
     return {name: getattr(value, name) for name in value.__dataclass_fields__} if hasattr(value, "__dataclass_fields__") else dict(value)
+
+def normalize_quantity(quantity: Any) -> int:
+    """把请求数量规范为正整数，保证同一逻辑请求得到同一指纹。"""
+    if isinstance(quantity, bool): raise ValueError("quantity must be a positive integer")
+    if isinstance(quantity, int): value = quantity
+    elif isinstance(quantity, float) and quantity.is_integer(): value = int(quantity)
+    else: raise ValueError("quantity must be a positive integer")
+    if value <= 0: raise ValueError("quantity must be positive")
+    return value
+
+def allocation_fingerprint(response_resource_id: str, case_ticket_id: str, quantity: int) -> str:
+    """分配请求关键内容（资源、工单、数量）的稳定 SHA-256 指纹。"""
+    body = {"case_ticket_id": case_ticket_id, "quantity": quantity, "response_resource_id": response_resource_id}
+    return hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
