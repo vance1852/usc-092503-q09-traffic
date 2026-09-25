@@ -1,10 +1,20 @@
 """协调道路执法监测、告警、工单和应急资源分配的应用服务。"""
 from __future__ import annotations
-import hashlib,uuid
+import hashlib,json,uuid
 from .auth import Auth
 from .models import ViolationRecord,CaseRecord,as_dict,utcnow
 from .risk import violation_probability,score_violation_record
-from .storage import audit,connect,rows,transaction
+from .storage import ConflictError,audit,connect,rows,transaction
+
+
+def _allocation_fingerprint(response_resource_id,case_ticket_id,quantity) -> str:
+    body=json.dumps(
+        {"response_resource_id":response_resource_id,"case_ticket_id":case_ticket_id,"quantity":quantity},
+        ensure_ascii=False,sort_keys=True,separators=(",",":"),
+    )
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
 class PenaltyService:
     def __init__(self,database=":memory:"): self.db=connect(database); self.auth=Auth(self.db)
     def bootstrap(self):
@@ -63,16 +73,87 @@ class PenaltyService:
         if not row:raise KeyError(response_resource_id)
         return dict(row)
     def allocate(self,token,response_resource_id,case_ticket_id,quantity):
+        """首次分配保存请求指纹；同指纹重试重放原结果，指纹冲突时拒绝且不动库存。"""
         actor=self.auth.require(token,"allocate")
         if quantity<=0:raise ValueError("quantity must be positive")
+        request_sha=_allocation_fingerprint(response_resource_id,case_ticket_id,quantity)
+        # 先在事务外读取已存响应：完全相同的重试直接重放，不触碰库存。
+        existing=self.db.execute(
+            "SELECT plan_id,quantity,request_sha256 FROM allocations WHERE response_resource_id=? AND case_ticket_id=?",
+            (response_resource_id,case_ticket_id),
+        ).fetchone()
+        if existing is not None:
+            if existing["request_sha256"]==request_sha:
+                return {"plan_id":existing["plan_id"],"duplicate":True,"replayed":True,
+                        "response_resource_id":response_resource_id,"quantity":existing["quantity"]}
+            raise ConflictError("该工单对此资源已有分配，请求内容与原分配不一致；如需调整请调用 allocation_adjust",
+                                {"plan_id":existing["plan_id"],"existing_quantity":existing["quantity"],
+                                 "requested_quantity":quantity})
         aid="alloc-"+uuid.uuid4().hex[:16]
         with transaction(self.db):
+            # 行锁内复查：挡住并发首次分配，保证只有一个请求写入并扣减库存。
+            existing=self.db.execute(
+                "SELECT plan_id,quantity,request_sha256 FROM allocations WHERE response_resource_id=? AND case_ticket_id=?",
+                (response_resource_id,case_ticket_id),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_sha256"]==request_sha:
+                    return {"plan_id":existing["plan_id"],"duplicate":True,"replayed":True,
+                            "response_resource_id":response_resource_id,"quantity":existing["quantity"]}
+                raise ConflictError("该工单对此资源已有分配，请求内容与原分配不一致；如需调整请调用 allocation_adjust",
+                                    {"plan_id":existing["plan_id"],"existing_quantity":existing["quantity"],
+                                     "requested_quantity":quantity})
             response_resource=self.db.execute("SELECT available FROM response_resources WHERE response_resource_id=?",(response_resource_id,)).fetchone()
             if not response_resource:raise KeyError(response_resource_id)
             if not self.db.execute("SELECT 1 FROM case_tickets WHERE case_ticket_id=?",(case_ticket_id,)).fetchone():raise KeyError(case_ticket_id)
             if response_resource[0]<quantity:raise ValueError("response_resource capacity exceeded")
-            old=self.db.execute("SELECT plan_id FROM allocations WHERE response_resource_id=? AND case_ticket_id=?",(response_resource_id,case_ticket_id)).fetchone()
-            if old:return {"plan_id":old[0],"duplicate":True}
-            self.db.execute("INSERT INTO allocations VALUES(?,?,?,?,?)",(aid,response_resource_id,case_ticket_id,quantity,utcnow())); self.db.execute("UPDATE response_resources SET available=available-? WHERE response_resource_id=?",(quantity,response_resource_id)); audit(self.db,"response_resource",response_resource_id,"allocated",actor.user_id,{"case_ticket_id":case_ticket_id,"quantity":quantity})
-        return {"plan_id":aid,"duplicate":False,"response_resource_id":response_resource_id,"quantity":quantity}
+            self.db.execute("INSERT INTO allocations(plan_id,response_resource_id,case_ticket_id,quantity,request_sha256,created_at) VALUES(?,?,?,?,?,?)",(aid,response_resource_id,case_ticket_id,quantity,request_sha,utcnow())); self.db.execute("UPDATE response_resources SET available=available-? WHERE response_resource_id=?",(quantity,response_resource_id)); audit(self.db,"response_resource",response_resource_id,"allocated",actor.user_id,{"plan_id":aid,"case_ticket_id":case_ticket_id,"quantity":quantity,"request_sha256":request_sha})
+        return {"plan_id":aid,"duplicate":False,"replayed":False,"response_resource_id":response_resource_id,"quantity":quantity}
+
+    def adjust_allocation(self,token,response_resource_id,case_ticket_id,new_quantity,reason,idempotency_key=None):
+        """可审计的分配调整：数量变化通过独立操作完成，记录调整流水，绝不静默覆盖。"""
+        actor=self.auth.require(token,"allocate")
+        if new_quantity<=0:raise ValueError("new_quantity must be positive")
+        if not reason or not reason.strip():raise ValueError("adjustment reason is required")
+        key=idempotency_key or "adj-"+uuid.uuid4().hex[:24]
+        with transaction(self.db):
+            current=self.db.execute(
+                "SELECT plan_id,quantity FROM allocations WHERE response_resource_id=? AND case_ticket_id=?",
+                (response_resource_id,case_ticket_id),
+            ).fetchone()
+            if not current:raise KeyError("allocation not found")
+            prior=self.db.execute("SELECT adjustment_id,previous_quantity,new_quantity FROM allocation_adjustments WHERE idempotency_key=?",(key,)).fetchone()
+            if prior is not None:
+                if prior["new_quantity"]!=new_quantity:
+                    raise ConflictError("调整幂等键对应不同的调整内容",
+                                        {"idempotency_key":key,"existing_new_quantity":prior["new_quantity"],
+                                         "requested_new_quantity":new_quantity})
+                # 相同调整请求重放：回传首次执行的原始结果，不再次改动库存。
+                return {"plan_id":current["plan_id"],"adjustment_id":prior["adjustment_id"],"duplicate":True,
+                        "replayed":True,"previous_quantity":prior["previous_quantity"],
+                        "quantity":prior["new_quantity"],"delta_units":0}
+            previous_quantity=current["quantity"]; delta=new_quantity-previous_quantity
+            if delta!=0:
+                resource=self.db.execute("SELECT available FROM response_resources WHERE response_resource_id=?",(response_resource_id,)).fetchone()
+                if resource[0]<delta:raise ValueError("response_resource capacity exceeded")
+                self.db.execute("UPDATE response_resources SET available=available-? WHERE response_resource_id=?",(delta,response_resource_id))
+            cursor=self.db.execute(
+                "INSERT INTO allocation_adjustments(plan_id,previous_quantity,new_quantity,delta_units,reason,idempotency_key,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (current["plan_id"],previous_quantity,new_quantity,delta,reason.strip(),key,actor.user_id,utcnow()),
+            )
+            self.db.execute("UPDATE allocations SET quantity=?,request_sha256=? WHERE plan_id=?",
+                            (new_quantity,_allocation_fingerprint(response_resource_id,case_ticket_id,new_quantity),current["plan_id"]))
+            audit(self.db,"allocation",current["plan_id"],"allocation.adjusted",actor.user_id,
+                  {"response_resource_id":response_resource_id,"case_ticket_id":case_ticket_id,
+                   "previous_quantity":previous_quantity,"new_quantity":new_quantity,"delta_units":delta,
+                   "reason":reason.strip(),"idempotency_key":key})
+        return {"plan_id":current["plan_id"],"adjustment_id":cursor.lastrowid,"duplicate":False,
+                "previous_quantity":previous_quantity,"quantity":new_quantity,"delta_units":delta}
+
+    def allocation(self,token,response_resource_id,case_ticket_id):
+        self.auth.require(token,"read")
+        row=self.db.execute("SELECT plan_id,response_resource_id,case_ticket_id,quantity,request_sha256,created_at FROM allocations WHERE response_resource_id=? AND case_ticket_id=?",(response_resource_id,case_ticket_id)).fetchone()
+        if not row:raise KeyError("allocation not found")
+        return dict(row)
+
     def audit_events(self,token,entity_type,entity_id): self.auth.require(token,"read"); return rows(self.db,"SELECT * FROM audit_events WHERE entity_type=? AND entity_id=? ORDER BY event_id",(entity_type,entity_id))

@@ -1,8 +1,9 @@
 """依赖标准库的 JSON HTTP API。"""
 from __future__ import annotations
 import argparse,json
-from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler,HTTPServer
 from .models import ViolationRecord,CaseRecord
+from .storage import ConflictError
 from .service import PenaltyService
 class Handler(BaseHTTPRequestHandler):
     service=PenaltyService()
@@ -14,8 +15,13 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=="/health":return self._send(200,{"status":"ok","service":"urban-enforcement"})
             if self.path.startswith("/case_records/") and self.path.endswith("/risk"):return self._send(200,self.service.risk_report(self._token(),self.path.split("/")[2]))
             if self.path.startswith("/case_records/"):return self._send(200,self.service.case_record(self._token(),self.path.split("/",2)[2]))
+            if self.path.startswith("/response_resources/") and self.path.count("/")==2:return self._send(200,self.service.response_resource(self._token(),self.path.rsplit("/",1)[1]))
+            if self.path.startswith("/allocations/") and self.path.count("/")==3:
+                _,_,rid,tid=self.path.split("/");return self._send(200,self.service.allocation(self._token(),rid,tid))
             return self._send(404,{"error":"not found"})
         except PermissionError as e:return self._send(403,{"error":str(e)})
+        except ConflictError as e:return self._send(409,{"error":str(e),"details":e.details})
+        except KeyError as e:return self._send(404,{"error":str(e)})
         except Exception as e:return self._send(400,{"error":str(e)})
     def do_POST(self):
         try:
@@ -27,9 +33,17 @@ class Handler(BaseHTTPRequestHandler):
                 sid=self.path.split("/")[2]; r=ViolationRecord(body["violation_record_id"],sid,body["evidence_source_id"],body["speed_kmh"],body["traffic_flow_vph"],body["impact_index"],body["observed_at"]); return self._send(201,self.service.ingest_violation_record(token,r))
             if self.path.startswith("/case_records/") and self.path.endswith("/work-orders"):
                 return self._send(201,self.service.create_case_ticket(token,self.path.split("/")[2],body["alert_id"],body["assignee"],body.get("priority",3)))
+            if self.path=="/response_resources":
+                return self._send(201,self.service.add_response_resource(token,body["response_resource_id"],body["kind"],body["district"],body["capacity"]))
+            if self.path=="/allocations":
+                return self._send(201,self.service.allocate(token,body["response_resource_id"],body["case_ticket_id"],body["quantity"]))
+            if self.path=="/allocations/adjust":
+                return self._send(200,self.service.adjust_allocation(token,body["response_resource_id"],body["case_ticket_id"],body["new_quantity"],body["reason"],body.get("idempotency_key")))
             return self._send(404,{"error":"not found"})
         except PermissionError as e:return self._send(403,{"error":str(e)})
+        except ConflictError as e:return self._send(409,{"error":str(e),"details":e.details})
+        except KeyError as e:return self._send(404,{"error":str(e)})
         except Exception as e:return self._send(400,{"error":str(e)})
 def main():
-    p=argparse.ArgumentParser(); p.add_argument("--database",default=":memory:"); p.add_argument("--host",default="127.0.0.1"); p.add_argument("--port",type=int,default=8080); a=p.parse_args(); Handler.service=PenaltyService(a.database); Handler.service.bootstrap(); ThreadingHTTPServer((a.host,a.port),Handler).serve_forever()
+    p=argparse.ArgumentParser(); p.add_argument("--database",default=":memory:"); p.add_argument("--host",default="127.0.0.1"); p.add_argument("--port",type=int,default=8080); a=p.parse_args(); Handler.service=PenaltyService(a.database); Handler.service.bootstrap(); HTTPServer((a.host,a.port),Handler).serve_forever()
 if __name__=="__main__":main()

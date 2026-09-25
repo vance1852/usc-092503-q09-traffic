@@ -13,12 +13,20 @@ CREATE TABLE IF NOT EXISTS violation_records(violation_record_id TEXT PRIMARY KE
 CREATE TABLE IF NOT EXISTS alerts(alert_id TEXT PRIMARY KEY,case_record_id TEXT NOT NULL REFERENCES case_records(case_record_id),fingerprint TEXT NOT NULL UNIQUE,severity TEXT NOT NULL,score REAL NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,resolved_at TEXT);
 CREATE TABLE IF NOT EXISTS case_tickets(case_ticket_id TEXT PRIMARY KEY,case_record_id TEXT NOT NULL,alert_id TEXT NOT NULL,assignee TEXT NOT NULL,status TEXT NOT NULL,priority INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS response_resources(response_resource_id TEXT PRIMARY KEY,kind TEXT NOT NULL,district TEXT NOT NULL,capacity INTEGER NOT NULL,available INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS allocations(plan_id TEXT PRIMARY KEY,response_resource_id TEXT NOT NULL,case_ticket_id TEXT NOT NULL,quantity INTEGER NOT NULL,created_at TEXT NOT NULL,UNIQUE(response_resource_id,case_ticket_id));
+CREATE TABLE IF NOT EXISTS allocations(plan_id TEXT PRIMARY KEY,response_resource_id TEXT NOT NULL,case_ticket_id TEXT NOT NULL,quantity INTEGER NOT NULL,request_sha256 TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,UNIQUE(response_resource_id,case_ticket_id));
+CREATE TABLE IF NOT EXISTS allocation_adjustments(adjustment_id INTEGER PRIMARY KEY AUTOINCREMENT,plan_id TEXT NOT NULL REFERENCES allocations(plan_id),previous_quantity INTEGER NOT NULL,new_quantity INTEGER NOT NULL,delta_units INTEGER NOT NULL,reason TEXT NOT NULL,idempotency_key TEXT UNIQUE,actor_id TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit_events(event_id INTEGER PRIMARY KEY AUTOINCREMENT,entity_type TEXT NOT NULL,entity_id TEXT NOT NULL,action TEXT NOT NULL,actor TEXT NOT NULL,payload TEXT NOT NULL,created_at TEXT NOT NULL);
 """
+class ConflictError(Exception):
+    """已存在分配但请求指纹不同；库存保持不变，需走调整操作。"""
+    def __init__(self,message,details=None):
+        super().__init__(message); self.details=details or {}
 def utcnow() -> str: return datetime.now(timezone.utc).isoformat()
 def connect(path: str = ":memory:") -> sqlite3.Connection:
-    db=sqlite3.connect(path,timeout=10); db.row_factory=sqlite3.Row; db.execute("PRAGMA foreign_keys=ON"); db.execute("PRAGMA journal_mode=WAL"); db.executescript(SCHEMA); db.commit(); return db
+    db=sqlite3.connect(path,timeout=10); db.row_factory=sqlite3.Row; db.execute("PRAGMA foreign_keys=ON"); db.execute("PRAGMA journal_mode=WAL"); db.executescript(SCHEMA)
+    try: db.execute("ALTER TABLE allocations ADD COLUMN request_sha256 TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError: pass
+    db.commit(); return db
 @contextmanager
 def transaction(db: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     try: db.execute("BEGIN IMMEDIATE"); yield db; db.commit()
